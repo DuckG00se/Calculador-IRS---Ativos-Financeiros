@@ -5,6 +5,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Calculadora IRS Portugal (Cat. E & G)</title>
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -21,18 +22,433 @@
         },
       }
     </script>
-  <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@^19.2.3",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
-    "react/": "https://esm.sh/react@^19.2.3/"
-  }
-}
-</script>
-</head>
+    <!-- React & Babel for in-browser JSX transpilation -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
   <body class="bg-light-bg text-dark-text">
     <div id="root"></div>
-    <script type="module" src="/index.tsx"></script>
+
+    <script type="text/babel">
+      // From constants.ts
+      const TAX_BRACKETS_2025 = [
+          { upTo: 16058, rate: 0.17, base: 0 }, { upTo: 21578, rate: 0.22, base: 2729.86 },
+          { upTo: 27146, rate: 0.25, base: 3944.26 }, { upTo: 38632, rate: 0.32, base: 5621.56 },
+          { upTo: 50483, rate: 0.35, base: 9343.43 }, { upTo: 83696, rate: 0.45, base: 14418.83 },
+          { upTo: Infinity, rate: 0.48, base: 29364.68 },
+      ];
+      const SOLIDARITY_SURCHARGE = { level1_threshold: 80000, level1_rate: 0.025, level2_threshold: 250000, level2_rate: 0.05 };
+      const HOLDING_PERIOD_DISCOUNTS = [
+          { years: 2, discount: 0.10 }, { years: 5, discount: 0.20 }, { years: 8, discount: 0.30 },
+      ];
+      const FLAT_RATE = 0.28;
+      const EU_DIVIDEND_EXCLUSION = 0.50;
+      const MANDATORY_AGGREGATION_THRESHOLD = 83696;
+
+      // From types.ts
+      const TransactionType = { BUY: 'BUY', SELL: 'SELL' };
+      const DividendSource = { PT_EU_EEE: 'PT_EU_EEE', OTHER: 'OTHER' };
+      const Tab = { CAT_G: 'CAT_G', CAT_E: 'CAT_E', SIMULATION: 'SIMULATION' };
+
+      // From services/taxCalculator.ts
+      const MS_IN_DAY = 1000 * 60 * 60 * 24;
+
+      const calculateHoldingPeriodDiscount = (days) => {
+          if (days <= 730) return 0;
+          const years = days / 365.25;
+          if (years <= 5) return HOLDING_PERIOD_DISCOUNTS[0].discount;
+          if (years <= 8) return HOLDING_PERIOD_DISCOUNTS[1].discount;
+          return HOLDING_PERIOD_DISCOUNTS[2].discount;
+      };
+
+      const calculateProgressiveTax = (taxableIncome) => {
+          if (taxableIncome <= 0) return { progressiveTax: 0, solidaritySurcharge: 0 };
+          let tax = 0;
+          const bracket = TAX_BRACKETS_2025.find(b => taxableIncome <= b.upTo);
+          if (bracket) {
+              const baseBracket = TAX_BRACKETS_2025[TAX_BRACKETS_2025.indexOf(bracket) - 1];
+              const incomeInBracket = taxableIncome - (baseBracket ? baseBracket.upTo : 0);
+              tax = (baseBracket ? baseBracket.base : 0) + incomeInBracket * bracket.rate;
+          } else {
+              const lastBracket = TAX_BRACKETS_2025[TAX_BRACKETS_2025.length - 2];
+              tax = lastBracket.base + (taxableIncome - lastBracket.upTo) * TAX_BRACKETS_2025[TAX_BRACKETS_2025.length - 1].rate;
+          }
+          let surcharge = 0;
+          if (taxableIncome > SOLIDARITY_SURCHARGE.level1_threshold) {
+              const surchargeableIncome = taxableIncome - SOLIDARITY_SURCHARGE.level1_threshold;
+              if (taxableIncome > SOLIDARITY_SURCHARGE.level2_threshold) {
+                  const incomeInLevel1 = SOLIDARITY_SURCHARGE.level2_threshold - SOLIDARITY_SURCHARGE.level1_threshold;
+                  const incomeInLevel2 = taxableIncome - SOLIDARITY_SURCHARGE.level2_threshold;
+                  surcharge = (incomeInLevel1 * SOLIDARITY_SURCHARGE.level1_rate) + (incomeInLevel2 * SOLIDARITY_SURCHARGE.level2_rate);
+              } else {
+                  surcharge = surchargeableIncome * SOLIDARITY_SURCHARGE.level1_rate;
+              }
+          }
+          return { progressiveTax: tax, solidaritySurcharge: surcharge };
+      };
+
+      const calculateCapitalGains = (transactions) => {
+          const buys = transactions.filter(t => t.type === TransactionType.BUY).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+          const sells = transactions.filter(t => t.type === TransactionType.SELL).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+          const buyQueue = buys.map(t => ({ transaction: t, remainingQty: t.quantity }));
+          const gainEntries = [];
+          for (const sell of sells) {
+              let sellQtyToMatch = sell.quantity;
+              const sellValuePerUnit = (sell.price * sell.quantity - sell.costs) / sell.quantity;
+              for (const buy of buyQueue) {
+                  if (sellQtyToMatch === 0) break;
+                  if (buy.remainingQty === 0 || buy.transaction.asset !== sell.asset) continue;
+                  const matchQty = Math.min(sellQtyToMatch, buy.remainingQty);
+                  const buyValuePerUnit = (buy.transaction.price * buy.transaction.quantity + buy.transaction.costs) / buy.transaction.quantity;
+                  const gain = (sellValuePerUnit - buyValuePerUnit) * matchQty;
+                  const sellDate = new Date(sell.date);
+                  const buyDate = new Date(buy.transaction.date);
+                  const holdingPeriodDays = Math.round((sellDate.getTime() - buyDate.getTime()) / MS_IN_DAY);
+                  const holdingDiscount = calculateHoldingPeriodDiscount(holdingPeriodDays);
+                  const taxableGain = gain > 0 ? gain * (1 - holdingDiscount) : gain;
+                  gainEntries.push({
+                      asset: sell.asset, buyDate: buy.transaction.date, sellDate: sell.date,
+                      holdingPeriodDays, quantity: matchQty, buyValue: buyValuePerUnit * matchQty,
+                      sellValue: sellValuePerUnit * matchQty, gain, holdingDiscount, taxableGain,
+                      isShortTerm: holdingPeriodDays < 365,
+                  });
+                  buy.remainingQty -= matchQty;
+                  sellQtyToMatch -= matchQty;
+              }
+          }
+          const positiveGains = gainEntries.filter(g => g.gain > 0);
+          const totalGains = positiveGains.reduce((acc, g) => acc + g.gain, 0);
+          const totalTaxableGains = positiveGains.reduce((acc, g) => acc + g.taxableGain, 0);
+          const hasShortTermGains = gainEntries.some(g => g.isShortTerm && g.gain > 0);
+          const totalLosses = gainEntries.filter(g => g.gain < 0).reduce((acc, g) => acc + g.gain, 0);
+          return {
+              totalGains: totalGains + totalLosses,
+              totalTaxableGains: totalTaxableGains + totalLosses,
+              hasShortTermGains, gainEntries,
+          };
+      };
+
+      const calculateDividendTax = (dividends) => {
+          const totalGross = dividends.reduce((acc, d) => acc + d.grossAmount, 0);
+          const totalWithholding = dividends.reduce((acc, d) => acc + d.withholdingTax, 0);
+          const taxableAmountFlat = totalGross;
+          const taxableAmountAggregated = dividends.reduce((acc, d) => {
+              if (d.source === DividendSource.PT_EU_EEE) {
+                  return acc + (d.grossAmount * (1 - EU_DIVIDEND_EXCLUSION));
+              }
+              return acc + d.grossAmount;
+          }, 0);
+          return { totalGross, totalWithholding, taxableAmountFlat, taxableAmountAggregated };
+      };
+      
+      const generateAnnexes = (gainsResult, dividendResult) => {
+          const annexG = gainsResult.gainEntries.map(g => ({
+              year: new Date(g.sellDate).getFullYear().toString(), assetType: 'Ações/Obrigações',
+              valueRealization: g.sellValue, valueAcquisition: g.buyValue, expenses: 0,
+          }));
+          const annexJ = [];
+          const annexE = [];
+          if (dividendResult.totalGross > 0) {
+              const ptEuDividends = dividendResult.totalGross;
+              if (ptEuDividends > 0) {
+                  annexE.push({ incomeType: 'E20', grossIncome: ptEuDividends });
+              }
+          }
+          return { g: annexG, j: annexJ, e: annexE };
+      };
+
+      const calculateTaxSimulation = (transactions, dividends, annualIncome) => {
+          const gainsResult = calculateCapitalGains(transactions);
+          const dividendResult = calculateDividendTax(dividends);
+          const taxableGains = Math.max(0, gainsResult.totalTaxableGains);
+          const catGTaxFlat = taxableGains * FLAT_RATE;
+          const catETaxFlat = dividendResult.taxableAmountFlat * FLAT_RATE;
+          const foreignTaxCreditFlat = Math.min(catETaxFlat, dividendResult.totalWithholding);
+          const finalTaxFlat = catGTaxFlat + catETaxFlat - foreignTaxCreditFlat;
+          const totalTaxableIncomeForAggregation = annualIncome + taxableGains + dividendResult.taxableAmountAggregated;
+          const { progressiveTax, solidaritySurcharge } = calculateProgressiveTax(totalTaxableIncomeForAggregation);
+          const totalTaxAggregated = progressiveTax + solidaritySurcharge;
+          const taxOnAggregatedDividends = calculateProgressiveTax(annualIncome + dividendResult.taxableAmountAggregated).progressiveTax - calculateProgressiveTax(annualIncome).progressiveTax;
+          const foreignTaxCreditAggregated = Math.min(taxOnAggregatedDividends, dividendResult.totalWithholding);
+          const finalTaxAggregated = totalTaxAggregated - foreignTaxCreditAggregated;
+          const mandatoryAggregation = gainsResult.hasShortTermGains && (annualIncome + gainsResult.totalGains) > MANDATORY_AGGREGATION_THRESHOLD;
+          const finalChoice = mandatoryAggregation ? 'AGGREGATED' : (finalTaxFlat < finalTaxAggregated ? 'FLAT' : 'AGGREGATED');
+          const result = {
+              flatRate: { totalTax: catGTaxFlat + catETaxFlat, catGTax: catGTaxFlat, catETax: catETaxFlat, finalTax: finalTaxFlat },
+              aggregatedRate: {
+                  totalTaxableIncome: totalTaxableIncomeForAggregation, progressiveTax, solidaritySurcharge,
+                  totalTax: totalTaxAggregated, foreignTaxCreditUsed: foreignTaxCreditAggregated, finalTax: finalTaxAggregated,
+              },
+              mandatoryAggregation, finalChoice, gainsResult, dividendResult,
+          };
+          const annexes = generateAnnexes(gainsResult, dividendResult);
+          return { result, annexes };
+      };
+
+      // From components/Icons.tsx
+      const InfoIcon = ({ className = 'h-6 w-6' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> );
+      const CalculatorIcon = ({ className = 'h-6 w-6' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg> );
+      const FileTextIcon = ({ className = 'h-6 w-6' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg> );
+      const LandmarkIcon = ({ className = 'h-6 w-6' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 21h18M5 21V10l7-6 7 6v11M9 21v-5a2 2 0 012-2h2a2 2 0 012 2v5"/></svg> );
+      const PlusCircleIcon = ({ className = 'h-6 w-6' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> );
+      const TrashIcon = ({ className = 'h-5 w-5' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg> );
+      const AlertTriangleIcon = ({ className = 'h-6 w-6' }) => ( <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg> );
+
+      // From components/TransactionLedger.tsx
+      const TransactionLedger = ({ transactions, setTransactions }) => {
+          const { useState } = React;
+          const [newTx, setNewTx] = useState({ type: TransactionType.BUY, asset: '', date: new Date().toISOString().split('T')[0], quantity: 0, price: 0, costs: 0, currency: 'EUR' });
+          const handleAddTransaction = () => {
+              if (!newTx.asset || newTx.quantity <= 0 || newTx.price <= 0) { alert('Please fill in all required fields for the transaction.'); return; }
+              setTransactions([...transactions, { ...newTx, id: new Date().toISOString() + Math.random() }]);
+              setNewTx({ type: TransactionType.BUY, asset: '', date: new Date().toISOString().split('T')[0], quantity: 0, price: 0, costs: 0, currency: 'EUR' });
+          };
+          const handleRemoveTransaction = (id) => { setTransactions(transactions.filter(tx => tx.id !== id)); };
+          const handleInputChange = (e) => {
+              const { name, value } = e.target;
+              const numericValue = ['quantity', 'price', 'costs'].includes(name) ? parseFloat(value) : value;
+              setNewTx({ ...newTx, [name]: numericValue });
+          };
+          return (
+            <div className="p-4 bg-gray-50 rounded-lg">
+                <h3 className="text-xl font-semibold mb-4 text-brand-blue">Registo de Transações (Mais-Valias)</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4 p-4 border rounded-lg">
+                    <select name="type" value={newTx.type} onChange={handleInputChange} className="p-2 border rounded-md"><option value={TransactionType.BUY}>Compra</option><option value={TransactionType.SELL}>Venda</option></select>
+                    <input type="text" name="asset" placeholder="Ativo (e.g., AAPL)" value={newTx.asset} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="date" name="date" value={newTx.date} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="number" name="quantity" placeholder="Quantidade" value={newTx.quantity || ''} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="number" name="price" placeholder="Preço Total" value={newTx.price || ''} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="number" name="costs" placeholder="Custos" value={newTx.costs || ''} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <div className="md:col-span-2 lg:col-span-4 flex justify-end">
+                        <button onClick={handleAddTransaction} className="flex items-center bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700"><PlusCircleIcon className="h-5 w-5 mr-2" />Adicionar Transação</button>
+                    </div>
+                </div>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm text-left text-gray-700">
+                        <thead className="text-xs text-gray-700 uppercase bg-gray-100"><tr><th scope="col" className="px-6 py-3">Tipo</th><th scope="col" className="px-6 py-3">Ativo</th><th scope="col" className="px-6 py-3">Data</th><th scope="col" className="px-6 py-3">Quantidade</th><th scope="col" className="px-6 py-3">Preço Total (€)</th><th scope="col" className="px-6 py-3">Custos (€)</th><th scope="col" className="px-6 py-3">Ação</th></tr></thead>
+                        <tbody>
+                            {transactions.map(tx => (
+                                <tr key={tx.id} className="bg-white border-b hover:bg-gray-50">
+                                    <td className={`px-6 py-4 font-medium ${tx.type === TransactionType.BUY ? 'text-green-600' : 'text-red-600'}`}>{tx.type === TransactionType.BUY ? 'Compra' : 'Venda'}</td>
+                                    <td className="px-6 py-4">{tx.asset}</td><td className="px-6 py-4">{tx.date}</td><td className="px-6 py-4">{tx.quantity.toLocaleString()}</td>
+                                    <td className="px-6 py-4">{tx.price.toLocaleString('pt-PT', { style: 'currency', currency: 'EUR' })}</td><td className="px-6 py-4">{tx.costs.toLocaleString('pt-PT', { style: 'currency', currency: 'EUR' })}</td>
+                                    <td className="px-6 py-4"><button onClick={() => handleRemoveTransaction(tx.id)} className="text-red-600 hover:text-red-800"><TrashIcon /></button></td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    {transactions.length === 0 && <p className="text-center text-gray-500 py-8">Nenhuma transação adicionada.</p>}
+                </div>
+            </div>
+          );
+      };
+
+      // From components/DividendLedger.tsx
+      const DividendLedger = ({ dividends, setDividends }) => {
+          const { useState } = React;
+          const [newDiv, setNewDiv] = useState({ asset: '', date: new Date().toISOString().split('T')[0], grossAmount: 0, withholdingTax: 0, source: DividendSource.PT_EU_EEE, currency: 'EUR' });
+          const handleAddDividend = () => {
+              if (!newDiv.asset || newDiv.grossAmount <= 0) { alert('Please fill in the asset and gross amount.'); return; }
+              setDividends([...dividends, { ...newDiv, id: new Date().toISOString() + Math.random() }]);
+              setNewDiv({ asset: '', date: new Date().toISOString().split('T')[0], grossAmount: 0, withholdingTax: 0, source: DividendSource.PT_EU_EEE, currency: 'EUR' });
+          };
+          const handleRemoveDividend = (id) => { setDividends(dividends.filter(div => div.id !== id)); };
+          const handleInputChange = (e) => {
+              const { name, value } = e.target;
+              const numericValue = ['grossAmount', 'withholdingTax'].includes(name) ? parseFloat(value) : value;
+              setNewDiv({ ...newDiv, [name]: numericValue });
+          };
+          return (
+            <div className="p-4 bg-gray-50 rounded-lg">
+                <h3 className="text-xl font-semibold mb-4 text-brand-blue">Registo de Dividendos e Juros</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-4 p-4 border rounded-lg">
+                    <input type="text" name="asset" placeholder="Ativo (e.g., EDPR)" value={newDiv.asset} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="date" name="date" value={newDiv.date} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="number" name="grossAmount" placeholder="Valor Bruto (€)" value={newDiv.grossAmount || ''} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <input type="number" name="withholdingTax" placeholder="Imposto Retido na Fonte (€)" value={newDiv.withholdingTax || ''} onChange={handleInputChange} className="p-2 border rounded-md" />
+                    <select name="source" value={newDiv.source} onChange={handleInputChange} className="p-2 border rounded-md"><option value={DividendSource.PT_EU_EEE}>Fonte PT/EU/EEE</option><option value={DividendSource.OTHER}>Outra Fonte</option></select>
+                    <div className="lg:col-span-3 flex justify-end">
+                        <button onClick={handleAddDividend} className="flex items-center bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700"><PlusCircleIcon className="h-5 w-5 mr-2" />Adicionar Rendimento</button>
+                    </div>
+                </div>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm text-left text-gray-700">
+                        <thead className="text-xs text-gray-700 uppercase bg-gray-100"><tr><th scope="col" className="px-6 py-3">Ativo</th><th scope="col" className="px-6 py-3">Data</th><th scope="col" className="px-6 py-3">Valor Bruto (€)</th><th scope="col" className="px-6 py-3">Retido na Fonte (€)</th><th scope="col" className="px-6 py-3">Fonte</th><th scope="col" className="px-6 py-3">Ação</th></tr></thead>
+                        <tbody>
+                            {dividends.map(div => (
+                                <tr key={div.id} className="bg-white border-b hover:bg-gray-50">
+                                    <td className="px-6 py-4">{div.asset}</td><td className="px-6 py-4">{div.date}</td>
+                                    <td className="px-6 py-4">{div.grossAmount.toLocaleString('pt-PT', { style: 'currency', currency: 'EUR' })}</td><td className="px-6 py-4">{div.withholdingTax.toLocaleString('pt-PT', { style: 'currency', currency: 'EUR' })}</td>
+                                    <td className="px-6 py-4">{div.source === DividendSource.PT_EU_EEE ? 'PT/EU/EEE' : 'Outra'}</td>
+                                    <td className="px-6 py-4"><button onClick={() => handleRemoveDividend(div.id)} className="text-red-600 hover:text-red-800"><TrashIcon /></button></td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    {dividends.length === 0 && <p className="text-center text-gray-500 py-8">Nenhum dividendo ou juro adicionado.</p>}
+                </div>
+            </div>
+          );
+      };
+      
+      // From components/TaxSimulation.tsx
+      const TaxSimulation = ({ result }) => {
+          const formatCurrency = (value) => value.toLocaleString('pt-PT', { style: 'currency', currency: 'EUR' });
+          const ResultCard = ({ title, children, isRecommended }) => (
+              <div className={`border rounded-lg shadow-md p-6 relative ${isRecommended ? 'bg-green-50 border-green-400' : 'bg-white'}`}>
+                  {isRecommended && <span className="absolute top-0 right-0 bg-green-600 text-white text-xs font-bold px-3 py-1 rounded-bl-lg">Recomendado</span>}
+                  <h4 className="text-lg font-bold text-brand-blue mb-4">{title}</h4>{children}
+              </div>
+          );
+          const isFlatRecommended = result.finalChoice === 'FLAT';
+          const isAggregatedRecommended = result.finalChoice === 'AGGREGATED';
+          return (
+              <div>
+                  <h3 className="text-2xl font-semibold mb-6 text-brand-blue border-b pb-2">Simulação de Imposto</h3>
+                  {result.mandatoryAggregation && (
+                      <div className="mb-6 p-4 border-l-4 border-red-500 bg-red-50 text-red-800 rounded-md flex items-start">
+                          <AlertTriangleIcon className="h-6 w-6 mr-3 mt-1 flex-shrink-0" />
+                          <div><h4 className="font-bold">Englobamento Obrigatório</h4><p>Foi detetada uma mais-valia de curto prazo (&lt;365 dias) e o seu rendimento coletável (outros rendimentos + mais-valias) excede o limiar. O englobamento é obrigatório.</p></div>
+                      </div>
+                  )}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                      <ResultCard title="Opção 1: Taxa Liberatória (28%)" isRecommended={isFlatRecommended}>
+                          <div className="space-y-3 text-sm"><p><strong>Imposto Cat. G (Mais-Valias):</strong> {formatCurrency(result.flatRate.catGTax)}</p><p><strong>Imposto Cat. E (Dividendos):</strong> {formatCurrency(result.flatRate.catETax)}</p><p><strong>Crédito Imposto Estrangeiro:</strong> {formatCurrency(-result.dividendResult.totalWithholding)}</p><hr className="my-2"/><p className="text-lg font-bold">Total a Pagar: <span className="text-brand-red">{formatCurrency(result.flatRate.finalTax)}</span></p></div>
+                      </ResultCard>
+                      <ResultCard title="Opção 2: Englobamento (Taxas Progressivas)" isRecommended={isAggregatedRecommended}>
+                          <div className="space-y-3 text-sm"><p><strong>Rendimento Coletável Total:</strong> {formatCurrency(result.aggregatedRate.totalTaxableIncome)}</p><p><strong>Coleta (Taxas Progressivas):</strong> {formatCurrency(result.aggregatedRate.progressiveTax)}</p><p><strong>Taxa Adicional Solidariedade:</strong> {formatCurrency(result.aggregatedRate.solidaritySurcharge)}</p><p><strong>Crédito Imposto Estrangeiro:</strong> {formatCurrency(-result.aggregatedRate.foreignTaxCreditUsed)}</p><hr className="my-2"/><p className="text-lg font-bold">Total a Pagar: <span className="text-brand-red">{formatCurrency(result.aggregatedRate.finalTax)}</span></p></div>
+                      </ResultCard>
+                  </div>
+                  <div className="mt-8 p-4 bg-gray-100 rounded-lg">
+                      <h4 className="font-semibold text-lg mb-2">Detalhe Ganhos de Capital</h4>
+                      <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                              <thead className="text-xs text-gray-700 uppercase bg-gray-200"><tr><th className="px-4 py-2">Ativo</th><th className="px-4 py-2">Período (dias)</th><th className="px-4 py-2">Ganho/Perda Bruto</th><th className="px-4 py-2">Desconto Retenção</th><th className="px-4 py-2">Ganho/Perda Líquido</th></tr></thead>
+                              <tbody>
+                                  {result.gainsResult.gainEntries.map((entry, index) => (
+                                      <tr key={index} className="border-b">
+                                          <td className="px-4 py-2">{entry.asset} ({entry.quantity.toFixed(2)})</td><td className="px-4 py-2">{entry.holdingPeriodDays}</td>
+                                          <td className={`px-4 py-2 ${entry.gain >= 0 ? 'text-green-700' : 'text-red-700'}`}>{formatCurrency(entry.gain)}</td><td className="px-4 py-2">{(entry.holdingDiscount * 100).toFixed(0)}%</td>
+                                          <td className={`px-4 py-2 font-medium ${entry.taxableGain >= 0 ? 'text-green-700' : 'text-red-700'}`}>{formatCurrency(entry.taxableGain)}</td>
+                                      </tr>
+                                  ))}
+                              </tbody>
+                          </table>
+                      </div>
+                  </div>
+              </div>
+          );
+      };
+
+      // From components/AnnexGenerator.tsx
+      const AnnexGenerator = ({ data }) => {
+          return (
+              <div>
+                  <h3 className="text-2xl font-semibold mb-6 text-brand-blue border-b pb-2">Gerador de Anexos (Simulado)</h3>
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                      <div className="bg-white p-4 rounded-lg shadow">
+                          <h4 className="font-bold text-lg mb-2">Anexo G - Mais-Valias</h4>
+                          <pre className="bg-gray-100 p-3 rounded text-sm overflow-x-auto"><code className="whitespace-pre-wrap">{`Quadro 9: Alienação Onerosa de Partes Sociais e Outros Valores Mobiliários\n------------------------------------------------------------------------\n${data.g.length > 0 ? data.g.map((entry, i) => `Entrada ${i + 1}:\n  Código: G01 - Ações\n  Ano Realização: ${entry.year}\n  Valor Realização: ${entry.valueRealization.toFixed(2)} EUR\n  Ano Aquisição: ${new Date(entry.year).getFullYear()} (FIFO)\n  Valor Aquisição: ${entry.valueAcquisition.toFixed(2)} EUR\n  Despesas: ${entry.expenses.toFixed(2)} EUR\n`).join('\n') : 'Nenhuns dados para o Anexo G.'}`}</code></pre>
+                      </div>
+                      <div className="space-y-8">
+                          <div className="bg-white p-4 rounded-lg shadow">
+                              <h4 className="font-bold text-lg mb-2">Anexo E - Rendimentos de Capitais</h4>
+                              <pre className="bg-gray-100 p-3 rounded text-sm overflow-x-auto"><code className="whitespace-pre-wrap">{`Quadro 4B: Rendimentos que foram objeto de retenção à taxa liberatória... mas não a título definitivo\n------------------------------------------------------------------------\n${data.e.length > 0 ? data.e.map((entry, i) => `Entrada ${i + 1}:\n  Código: ${entry.incomeType} - Lucros distribuídos por entidades sujeitas a IRC\n  Rendimentos Brutos: ${entry.grossIncome.toFixed(2)} EUR\n  Retenções na Fonte: (Verificar extratos)\n`).join('\n') : 'Nenhuns dados para o Anexo E.'}`}</code></pre>
+                          </div>
+                          <div className="bg-white p-4 rounded-lg shadow">
+                              <h4 className="font-bold text-lg mb-2">Anexo J - Rendimentos Obtidos no Estrangeiro</h4>
+                              <pre className="bg-gray-100 p-3 rounded text-sm overflow-x-auto"><code className="whitespace-pre-wrap">{`Quadro 9.2: Ganhos de Alienação de Partes Sociais (Cat. G)\nQuadro 8A: Rendimentos de Capitais (Cat. E)\n------------------------------------------------------------------------\n${data.j.length > 0 ? data.j.map((entry, i) => `Entrada ${i + 1}:\n  País da Fonte: ${entry.country}\n  Código Rendimento: ${entry.incomeType}\n  Rendimento Bruto: ${entry.grossIncome.toFixed(2)} EUR\n  Imposto Pago Estrangeiro: ${entry.taxPaidAbroad.toFixed(2)} EUR\n`).join('\n') : 'Nenhuns dados para o Anexo J. (Esta versão simplificada assume rendimentos domésticos).'}`}</code></pre>
+                          </div>
+                      </div>
+                  </div>
+              </div>
+          );
+      };
+      
+      // From App.tsx
+      const App = () => {
+          const { useState, cloneElement } = React;
+          const [activeTab, setActiveTab] = useState(Tab.CAT_G);
+          const [transactions, setTransactions] = useState([]);
+          const [dividends, setDividends] = useState([]);
+          const [annualIncome, setAnnualIncome] = useState(50000);
+          const [simulationResult, setSimulationResult] = useState(null);
+          const [annexData, setAnnexData] = useState(null);
+
+          const handleCalculate = () => {
+              const { result, annexes } = calculateTaxSimulation(transactions, dividends, annualIncome);
+              setSimulationResult(result);
+              setAnnexData(annexes);
+              setActiveTab(Tab.SIMULATION);
+          };
+          
+          const tabs = [
+              { id: Tab.CAT_G, label: 'Ganhos de Capital (Cat. G)', icon: <LandmarkIcon /> },
+              { id: Tab.CAT_E, label: 'Dividendos/Juros (Cat. E)', icon: <FileTextIcon /> },
+              { id: Tab.SIMULATION, label: 'Simulação & Anexos', icon: <CalculatorIcon /> },
+          ];
+
+          return (
+              <div className="min-h-screen bg-gray-50 p-4 md:p-8 font-sans">
+                  <div className="max-w-7xl mx-auto">
+                      <header className="mb-8 p-6 bg-brand-blue text-white rounded-lg shadow-lg">
+                          <h1 className="text-3xl md:text-4xl font-bold">Calculadora de IRS 2024/2025</h1>
+                          <p className="mt-2 text-lg text-gray-200">Categorias E (Dividendos/Juros) & G (Ganhos de Capital)</p>
+                      </header>
+                      <main className="bg-white p-4 sm:p-6 rounded-lg shadow-md">
+                          <div className="mb-6 p-4 border-l-4 border-yellow-400 bg-yellow-50 text-yellow-800 rounded-md flex items-start">
+                              <InfoIcon className="h-6 w-6 mr-3 mt-1 flex-shrink-0" />
+                              <div><h4 className="font-bold">Aviso Importante</h4><p>Esta ferramenta é um simulador e não substitui aconselhamento fiscal profissional. Para transações em moeda estrangeira, utilize as taxas de câmbio do Banco de Portugal para as datas de compra e venda.</p></div>
+                          </div>
+                          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+                              <div className="lg:col-span-1">
+                                  <label htmlFor="annualIncome" className="block text-sm font-medium text-gray-700 mb-1">Outros Rendimentos Anuais (Agregados)</label>
+                                  <div className="relative"><span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">€</span><input type="number" id="annualIncome" value={annualIncome} onChange={(e) => setAnnualIncome(parseFloat(e.target.value) || 0)} className="w-full pl-7 pr-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-brand-blue focus:border-brand-blue" placeholder="e.g., 50000" /></div>
+                              </div>
+                          </div>
+                          <div className="border-b border-gray-200 mb-6">
+                              <nav className="-mb-px flex space-x-4" aria-label="Tabs">
+                                  {tabs.map((tab) => (
+                                      <button key={tab.id} onClick={() => setActiveTab(tab.id)} className={`${activeTab === tab.id ? 'border-brand-blue text-brand-blue' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'} whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm flex items-center transition-colors duration-200`}>
+                                          {cloneElement(tab.icon, { className: 'h-5 w-5 mr-2' })} {tab.label}
+                                      </button>
+                                  ))}
+                              </nav>
+                          </div>
+                          <div className="transition-all duration-300">
+                              {activeTab === Tab.CAT_G && <TransactionLedger transactions={transactions} setTransactions={setTransactions} />}
+                              {activeTab === Tab.CAT_E && <DividendLedger dividends={dividends} setDividends={setDividends} />}
+                              {activeTab === Tab.SIMULATION && (
+                                  <>
+                                      {simulationResult && annexData ? (
+                                          <div className="space-y-8"><TaxSimulation result={simulationResult} /><AnnexGenerator data={annexData} /></div>
+                                      ) : (
+                                          <div className="text-center py-12 text-gray-500"><CalculatorIcon className="h-12 w-12 mx-auto mb-4" /><p className="text-lg">Preencha os dados nas abas anteriores e clique em "Calcular Imposto" para ver a simulação.</p></div>
+                                      )}
+                                  </>
+                              )}
+                          </div>
+                          <div className="mt-8 pt-6 border-t border-gray-200 flex justify-end">
+                              <button onClick={handleCalculate} className="bg-brand-green hover:bg-opacity-90 text-white font-bold py-3 px-8 rounded-lg shadow-md transition-transform transform hover:scale-105 flex items-center"><CalculatorIcon className="h-5 w-5 mr-2" />Calcular Imposto</button>
+                          </div>
+                      </main>
+                      <footer className="text-center mt-8 text-gray-500 text-sm">
+                          <p>&copy; {new Date().getFullYear()} Calculadora IRS Portugal. Todos os direitos reservados.</p>
+                      </footer>
+                  </div>
+              </div>
+          );
+      };
+
+      // From index.tsx
+      const rootElement = document.getElementById('root');
+      const root = ReactDOM.createRoot(rootElement);
+      root.render(
+        <React.StrictMode>
+          <App />
+        </React.StrictMode>
+      );
+    </script>
   </body>
 </html>
