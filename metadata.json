@@ -1,0 +1,5 @@
+{
+  "name": "Calculadora IRS Portugal (Cat. E & G)",
+  "description": "A comprehensive tool to calculate Portuguese IRS for capital gains (Category G) and dividends/interest (Category E) based on 2024/2025 legislation. It includes FIFO calculations, holding period discounts, mandatory aggregation rules, and generates simulated tax annexes.",
+  "requestFramePermissions": []
+}
